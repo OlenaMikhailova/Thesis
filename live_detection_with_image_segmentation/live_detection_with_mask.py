@@ -11,13 +11,10 @@ import torch
 from PIL import Image
 from fastai.vision.all import load_learner
 
-# === Шлях для fastai
 pathlib.PosixPath = pathlib.WindowsPath
 
-# === Завантаження моделі класифікації
 learn = load_learner('fatigue_model_training\\yawn_eye_model.pkl')
 
-# === Завантаження моделі сегментації
 from inference import load_model, prepare_image
 from mask_interpeter import find_part_rect, left_right_eye, adjust_eye_rects_by_face
 
@@ -105,7 +102,6 @@ class DriverFatigueProcessingStream:
         seg_mask_eyes = ((seg_mask == 4) | (seg_mask == 5)).astype(np.uint8) * 255
         left_eye_rect, right_eye_rect = left_right_eye(seg_mask_eyes)
 
-        # Перевірка очей на None або порожні прямокутники перед корекцією
         if left_eye_rect is None:
             left_eye_rect = (0, 0, 0, 0)
         if right_eye_rect is None:
