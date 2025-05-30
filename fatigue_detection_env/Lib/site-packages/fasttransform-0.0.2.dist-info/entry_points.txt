@@ -1,0 +1,2 @@
+[nbdev]
+fasttransform = fasttransform._modidx:d

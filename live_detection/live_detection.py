@@ -13,7 +13,7 @@ pathlib.PosixPath = pathlib.WindowsPath
 
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
-learn = load_learner('yawn_eye_model.pkl')
+learn = load_learner('fatigue_model_training\\yawn_eye_model.pkl')
 
 
 @dataclass
