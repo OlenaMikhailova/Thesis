@@ -1,30 +1,94 @@
 from dataclasses import dataclass
 import time
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 import cv2
 from threading import Thread, Lock
 from fastai.vision.all import load_learner
 import numpy as np
 import pathlib
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
-from inference import load_model, prepare_image 
-
+from inference import load_model, prepare_image
 from mask_moments_utils import (
-    rect_to_rotated_box_points,
-    get_moment_and_rotated_rect,
-    get_fallback_eye_rects,
-    get_fallback_mouth_rect
+    calculate_centroids,
+    find_part_rect,
+    left_right_eye,
+    adjust_features_by_proportion
 )
 
-pathlib.PosixPath = pathlib.WindowsPath
+TRANSLATION_DICT = {
+    "Open": "Відкритий",
+    "Closed": "Закрите",
+    "yawn": "Позіхання",
+    "no_yawn": "Спокійний",
+    "Face": "Обличчя",
+    "left_eye": "Ліве око",
+    "right_eye": "Праве око",
+    "ANALYZING": "Аналіз...",
+    "NORMAL": "Норма",
+    "PROLONGED_FATIGUE": "ТРИВАЛА ВТОМА!"
+}
+
+def rect_to_box_points(rect):
+    if rect is None: return None
+    x, y, w, h = rect
+    return np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], dtype=np.int32)
+
+if hasattr(pathlib, 'PosixPath'):
+    pathlib.PosixPath = pathlib.WindowsPath
+
+class FatigueAnalyzer:
+    def __init__(self, fps, history_seconds, eye_plateau_sec, yawn_plateau_sec, fatigue_confidence=0.75):
+        self.FPS = fps
+        self.FRAMES_TO_REMEMBER = int(fps * history_seconds)
+        self.EYE_PLATEAU_FRAMES = int(fps * eye_plateau_sec)
+        self.YAWN_PLATEAU_FRAMES = int(fps * yawn_plateau_sec)
+        self.FATIGUE_CONFIDENCE_THRESHOLD = fatigue_confidence
+        
+        self.queue = np.zeros((self.FRAMES_TO_REMEMBER, 3), dtype=np.float16)
+        self.WARMUP_FRAMES = self.FRAMES_TO_REMEMBER // 2
+        self.frame_idx = 0
+        print(f"Ініціалізовано аналізатор втоми: Плато для очей={eye_plateau_sec}с, Плато для рота={yawn_plateau_sec}с")
+        print(f"Поріг спрацювання втоми: {int(self.FATIGUE_CONFIDENCE_THRESHOLD * 100)}% кадрів у періоді")
+
+    def add_and_analyze(self, left_eye_closed, right_eye_closed, is_mouth_fatigue_indicator) -> str:
+        self.queue = np.roll(self.queue, shift=-1, axis=0)
+        self.queue[-1, :] = [left_eye_closed, right_eye_closed, is_mouth_fatigue_indicator]
+
+        if self.frame_idx < self.WARMUP_FRAMES:
+            self.frame_idx += 1
+            return "ANALYZING"
+
+        is_prolonged_fatigue = False
+        
+        eye_fatigue_frames_needed = self.EYE_PLATEAU_FRAMES * self.FATIGUE_CONFIDENCE_THRESHOLD
+        
+        if (np.sum(self.queue[-self.EYE_PLATEAU_FRAMES:, 0]) >= eye_fatigue_frames_needed or
+            np.sum(self.queue[-self.EYE_PLATEAU_FRAMES:, 1]) >= eye_fatigue_frames_needed):
+            is_prolonged_fatigue = True
+            
+        mouth_fatigue_frames_needed = self.YAWN_PLATEAU_FRAMES * self.FATIGUE_CONFIDENCE_THRESHOLD
+        
+        if np.sum(self.queue[-self.YAWN_PLATEAU_FRAMES:, 2]) >= mouth_fatigue_frames_needed:
+            is_prolonged_fatigue = True
+
+        return "PROLONGED_FATIGUE" if is_prolonged_fatigue else "NORMAL"
 
 @dataclass
 class DriverEye:
+    id: str
     box_points: np.ndarray
     centroid: Tuple[int, int]
     label: str
+    original_label: str
+
+@dataclass
+class DriverMouth:
+    box_points: np.ndarray
+    centroid: Tuple[int, int]
+    label: str
+    original_label: str
 
 @dataclass
 class DriverFace:
@@ -32,254 +96,264 @@ class DriverFace:
     centroid: Tuple[int, int]
     label: str
     eyes: List[DriverEye]
+    mouth: Optional[DriverMouth]
+    historical_status: str
 
 class FaceSegmentationModel:
     def __init__(self, model_name: str, weight_path: str, input_size: Tuple[int, int] = (512, 512)):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.input_size = input_size
-        self.num_classes = 19 
-
+        self.num_classes = 19
         self.model = load_model(model_name, self.num_classes, weight_path, self.device)
+        print(f"Модель для сегментації обличчя завантажена на {self.device}")
 
     @torch.no_grad()
     def predict_mask(self, frame: np.ndarray) -> np.ndarray:
         image_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        
         original_h, original_w = frame.shape[:2]
-
         image_batch_tensor = prepare_image(image_pil, self.input_size).to(self.device)
-
-        # Run inference
-        output = self.model(image_batch_tensor)[0] 
+        output = self.model(image_batch_tensor)[0]
         predicted_mask_resized = output.squeeze(0).cpu().numpy().argmax(0)
-
-        predicted_mask = cv2.resize(predicted_mask_resized.astype(np.uint8), 
-                                     (original_w, original_h), 
+        predicted_mask = cv2.resize(predicted_mask_resized.astype(np.uint8),
+                                     (original_w, original_h),
                                      interpolation=cv2.INTER_NEAREST)
-        
         return predicted_mask
 
 class DriverFatigueProcessingStream:
-    def __init__(self, segmentation_model: FaceSegmentationModel):
+    def __init__(self, segmentation_model: FaceSegmentationModel, analyzer: FatigueAnalyzer):
         self.started = False
         self.process_lock = Lock()
         self.frame = None
-        self.facial_obj: List[DriverFace] = []
+        self.processed_facial_obj: List[DriverFace] = []
+        self.processed_frame: np.ndarray = None
         self.segmentation_model = segmentation_model
-
-        self.EYE_LABELS = [4, 5] 
-        self.MOUTH_LABELS = [11, 12, 13] 
-
+        self.analyzer = analyzer
+        self.FACE_LABELS = [1]; self.BROW_LABELS = [2, 3]; self.EYE_LABELS = [4, 5]
+        self.NOSE_LABELS = [10]; self.MOUTH_LABELS = [11, 12, 13]
         self.learn = load_learner('fatigue_model_training\\yawn_eye_model.pkl')
-
+        print("Завантажено класифікатор втоми.")
+    
     def start(self):
-        if self.started:
-            return None
+        if self.started: return None
         self.started = True
         self.thread = Thread(target=self.process, args=())
         self.thread.daemon = True
         self.thread.start()
         return self
-
+    
     def process(self):
         while self.started:
-            self.process_lock.acquire()
-            if self.frame is not None:
-                self.facial_obj = self.detect_facial_obj(
-                    self.frame.copy() 
-                )
-            self.process_lock.release()
-            time.sleep(0.01)
-
-    def update(self, frame) -> List[DriverFace]:
-        self.process_lock.acquire()
-        self.frame = frame
-        current_facial_obj = self.facial_obj.copy() 
-        self.process_lock.release()
-        return current_facial_obj
-
+            with self.process_lock:
+                frame_to_process = self.frame.copy() if self.frame is not None else None
+            if frame_to_process is not None:
+                detected_faces, frame_mask = self.detect_facial_obj(frame_to_process)
+                with self.process_lock:
+                    self.processed_facial_obj = detected_faces
+                    self.processed_frame = frame_mask
+            else: time.sleep(0.01)
+    
+    def update(self, frame: np.ndarray):
+        with self.process_lock:
+            self.frame = frame
+    
+    def read(self) -> List[DriverFace]:
+        with self.process_lock:
+            return self.processed_facial_obj.copy()
+        
+    def read_mask(self) -> np.ndarray:
+        with self.process_lock:
+            return self.processed_frame
+    
     def stop(self):
-        self.started = False
-        if self.thread.is_alive():
-            self.thread.join()
-        if self.process_lock.locked():
-            self.process_lock.release()
+        print("Зупинка обробки потоку..."); self.started = False
+        if hasattr(self, 'thread') and self.thread.is_alive(): self.thread.join()
+        if self.process_lock.locked(): self.process_lock.release()
+        print("Потік зупинено.")
 
     def detect_facial_obj(self, frame: np.ndarray) -> List[DriverFace]:
         seg_mask = self.segmentation_model.predict_mask(frame)
-        
-        if seg_mask is None or seg_mask.shape[:2] != frame.shape[:2]:
-            return []
-        
-        faces = []
 
-        seg_mask_face_binary = np.zeros_like(seg_mask, dtype=np.uint8)
-        seg_mask_face_binary[seg_mask != 0] = 255 
+        if seg_mask.shape[:2] != frame.shape[:2]: return [], None
+        part_masks = {name: np.isin(seg_mask, labels).astype(np.uint8) * 255 for name, labels in {
+            'face': self.FACE_LABELS, 'eyes': self.EYE_LABELS, 'brows': self.BROW_LABELS,
+            'nose': self.NOSE_LABELS, 'mouth': self.MOUTH_LABELS
+        }.items()}
+        face_rect = find_part_rect(part_masks['face'])
 
-        seg_mask_eyes_binary = np.zeros_like(seg_mask, dtype=np.uint8)
-        for label in self.EYE_LABELS:
-            seg_mask_eyes_binary[seg_mask == label] = 255 
+        if face_rect is None:
+            hist_status = self.analyzer.add_and_analyze(0.0, 0.0, 0.0)
+            return [], None
 
-        seg_mask_mouth_binary = np.zeros_like(seg_mask, dtype=np.uint8)
-        for label in self.MOUTH_LABELS:
-            seg_mask_mouth_binary[seg_mask == label] = 255 
-        
-        
-        face_rect_xywh = None
-        face_contours, _ = cv2.findContours(seg_mask_face_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if face_contours:
-            largest_face_contour = max(face_contours, key=cv2.contourArea)
-            face_rect_xywh = cv2.boundingRect(largest_face_contour)
-        
-        left_eye_final_data = None
-        right_eye_final_data = None
-        mouth_final_data = None
-        face_final_data = None
+        left_eye_rect, right_eye_rect = left_right_eye(part_masks['eyes'])
+        left_brow_rect, right_brow_rect = left_right_eye(part_masks['brows'])
+        nose_rect = find_part_rect(part_masks['nose'])
+        mouth_rect = find_part_rect(part_masks['mouth'])
+        eye_c = calculate_centroids(part_masks['eyes']); initial_left_c, initial_right_c = (eye_c[0] if len(eye_c)>0 else None), (eye_c[1] if len(eye_c)>1 else None)
+        brow_c = calculate_centroids(part_masks['brows']); initial_left_brow_c, initial_right_brow_c = (brow_c[0] if len(brow_c)>0 else None), (brow_c[1] if len(brow_c)>1 else None)
+        mouth_c = calculate_centroids(part_masks['mouth']); initial_mouth_c = mouth_c[0] if mouth_c else None
+        nose_c = calculate_centroids(part_masks['nose']); initial_nose_c = nose_c[0] if nose_c else None
+        (adj_left_eye, adj_right_eye, adj_mouth), (final_left_c, final_right_c, final_mouth_c) = adjust_features_by_proportion(
+            face_rect,
+            (left_eye_rect, right_eye_rect, initial_left_c, initial_right_c),
+            (mouth_rect, initial_mouth_c),
+            (left_brow_rect, right_brow_rect, initial_left_brow_c, initial_right_brow_c),
+            (nose_rect, initial_nose_c)
+        )
 
-        if face_rect_xywh is not None:
-            face_centroid = (face_rect_xywh[0] + face_rect_xywh[2] // 2, face_rect_xywh[1] + face_rect_xywh[3] // 2)
-            face_box_points = rect_to_rotated_box_points(face_rect_xywh)
-            face_final_data = (face_box_points, face_centroid, (None, (face_rect_xywh[2], face_rect_xywh[3]), 0.0))
+        eyes_for_face, mouth_for_face = [], None
+        def classify_and_create_driver_part(rect, centroid, original_frame, learner):
+            if rect is None or centroid is None: return None, None, None
+            x, y, w, h = rect
+            if w <= 0 or h <= 0: return None, None, None
+            roi = original_frame[y:y+h, x:x+w]
+            if roi.size == 0: return None, None, None
+            pred_label_orig, _, _ = learner.predict(roi)
+            pred_label_orig = str(pred_label_orig)
+            ukrainian_label = TRANSLATION_DICT.get(pred_label_orig, pred_label_orig)
+            return ukrainian_label, rect_to_box_points(rect), pred_label_orig
 
-            eye_contours_found, _ = cv2.findContours(seg_mask_eyes_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            detected_eyes_full_info = []
+        left_eye_label, left_eye_box, left_eye_orig = classify_and_create_driver_part(adj_left_eye, final_left_c, frame, self.learn)
+        right_eye_label, right_eye_box, right_eye_orig = classify_and_create_driver_part(adj_right_eye, final_right_c, frame, self.learn)
+        mouth_label, mouth_box, mouth_orig = classify_and_create_driver_part(adj_mouth, final_mouth_c, frame, self.learn)
 
-            for contour in eye_contours_found:
-                temp_eye_mask = np.zeros_like(seg_mask_eyes_binary)
-                cv2.drawContours(temp_eye_mask, [contour], -1, 255, thickness=cv2.FILLED)
-                part_info = get_moment_and_rotated_rect(temp_eye_mask)
-                if part_info:
-                    detected_eyes_full_info.append(part_info)
+        if left_eye_box is not None: eyes_for_face.append(DriverEye('left_eye', left_eye_box, final_left_c, left_eye_label, left_eye_orig))
+        if right_eye_box is not None: eyes_for_face.append(DriverEye('right_eye', right_eye_box, final_right_c, right_eye_label, right_eye_orig))
+        if mouth_box is not None: mouth_for_face = DriverMouth(mouth_box, final_mouth_c, mouth_label, mouth_orig)
 
-            if len(detected_eyes_full_info) == 2:
-                detected_eyes_full_info.sort(key=lambda x: x[1][0]) 
-                left_eye_final_data = (detected_eyes_full_info[0][3], detected_eyes_full_info[0][1], detected_eyes_full_info[0][2])
-                right_eye_final_data = (detected_eyes_full_info[1][3], detected_eyes_full_info[1][1], detected_eyes_full_info[1][2])
+        left_eye_val = 1.0 if left_eye_orig == "Closed" else 0.0
+        right_eye_val = 1.0 if right_eye_orig == "Closed" else 0.0
+        mouth_val = 1.0 if mouth_orig in ["yawn", "Open"] else 0.0
+        hist_status = self.analyzer.add_and_analyze(left_eye_val, right_eye_val, mouth_val)
 
-            elif len(detected_eyes_full_info) == 1:
-                detected_eye_full_info = detected_eyes_full_info[0]
-                detected_eye_xywh = cv2.boundingRect(detected_eye_full_info[3])
-                
-                left_eye_detected_for_fallback_xywh = None
-                right_eye_detected_for_fallback_xywh = None
-                if detected_eye_xywh[0] < face_rect_xywh[0] + face_rect_xywh[2] / 2:
-                    left_eye_detected_for_fallback_xywh = detected_eye_xywh
-                    left_eye_final_data = (detected_eye_full_info[3], detected_eye_full_info[1], detected_eye_full_info[2])
-                else:
-                    right_eye_detected_for_fallback_xywh = detected_eye_xywh
-                    right_eye_final_data = (detected_eye_full_info[3], detected_eye_full_info[1], detected_eye_full_info[2])
+        face_centroid = (face_rect[0] + face_rect[2] // 2, face_rect[1] + face_rect[3] // 2)
+        faces = [DriverFace(rect_to_box_points(face_rect), face_centroid, TRANSLATION_DICT['Face'],
+                                eyes_for_face, mouth_for_face, hist_status)]
+        return faces, seg_mask
 
-                inferred_left_eye_xywh, inferred_right_eye_xywh = get_fallback_eye_rects(
-                    face_rect_xywh, 
-                    left_eye_detected_for_fallback_xywh, 
-                    right_eye_detected_for_fallback_xywh, 
-                    frame.shape
-                )
-                
-                if left_eye_final_data is None and inferred_left_eye_xywh is not None:
-                    centroid_l = (inferred_left_eye_xywh[0] + inferred_left_eye_xywh[2]//2, inferred_left_eye_xywh[1] + inferred_left_eye_xywh[3]//2)
-                    size_l = (inferred_left_eye_xywh[2], inferred_left_eye_xywh[3])
-                    left_eye_final_data = (rect_to_rotated_box_points(inferred_left_eye_xywh), centroid_l, (None, size_l, 0.0))
-                
-                if right_eye_final_data is None and inferred_right_eye_xywh is not None:
-                    centroid_r = (inferred_right_eye_xywh[0] + inferred_right_eye_xywh[2]//2, inferred_right_eye_xywh[1] + inferred_right_eye_xywh[3]//2)
-                    size_r = (inferred_right_eye_xywh[2], inferred_right_eye_xywh[3])
-                    right_eye_final_data = (rect_to_rotated_box_points(inferred_right_eye_xywh), centroid_r, (None, size_r, 0.0))
+def draw_info_panel(frame, faces_data, font, panel_width=300):
+    h, w, _ = frame.shape
+    display_frame = np.zeros((h, w + panel_width, 3), dtype=np.uint8)
+    display_frame[0:h, 0:w] = frame
+    cv2.rectangle(display_frame, (w, 0), (w + panel_width, h), (20, 20, 20), -1)
 
-            elif len(detected_eyes_full_info) == 0:
-                inferred_left_eye_xywh, inferred_right_eye_xywh = get_fallback_eye_rects(face_rect_xywh, None, None, frame.shape)
-                
-                centroid_l = (inferred_left_eye_xywh[0] + inferred_left_eye_xywh[2]//2, inferred_left_eye_xywh[1] + inferred_left_eye_xywh[3]//2)
-                size_l = (inferred_left_eye_xywh[2], inferred_left_eye_xywh[3])
-                left_eye_final_data = (rect_to_rotated_box_points(inferred_left_eye_xywh), centroid_l, (None, size_l, 0.0))
+    if faces_data:
+        face = faces_data[0]
+        cv2.polylines(display_frame, [face.box_points], True, (0, 255, 0), 2)
+        for eye in face.eyes:
+            is_closed = eye.original_label == "Closed"
+            color = (0, 0, 255) if is_closed else (0, 255, 255)
+            cv2.polylines(display_frame, [eye.box_points], True, color, 2)
+        if face.mouth:
+            is_fatigue_indicator = face.mouth.original_label in ["yawn", "Open"]
+            color = (0, 0, 255) if is_fatigue_indicator else (255, 255, 0)
+            cv2.polylines(display_frame, [face.mouth.box_points], True, color, 2)
 
-                centroid_r = (inferred_right_eye_xywh[0] + inferred_right_eye_xywh[2]//2, inferred_right_eye_xywh[1] + inferred_right_eye_xywh[3]//2)
-                size_r = (inferred_right_eye_xywh[2], inferred_right_eye_xywh[3])
-                right_eye_final_data = (rect_to_rotated_box_points(inferred_right_eye_xywh), centroid_r, (None, size_r, 0.0))
+    pil_image = Image.fromarray(cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil_image)
+    text_x, text_y, line_height = w + 20, 30, 35
+    draw.text((text_x, text_y), "СТАТУС ВОДІЯ", font=font, fill=(255, 255, 255))
+    text_y += line_height
 
-            mouth_detected_full_info = get_moment_and_rotated_rect(seg_mask_mouth_binary)
-            if mouth_detected_full_info:
-                mouth_final_data = (mouth_detected_full_info[3], mouth_detected_full_info[1], mouth_detected_full_info[2])
-            elif face_rect_xywh is not None:
-                inferred_mouth_xywh = get_fallback_mouth_rect(face_rect_xywh, frame.shape)
-                centroid_m = (inferred_mouth_xywh[0] + inferred_mouth_xywh[2]//2, inferred_mouth_xywh[1] + inferred_mouth_xywh[3]//2)
-                size_m = (inferred_mouth_xywh[2], inferred_mouth_xywh[3])
-                mouth_final_data = (rect_to_rotated_box_points(inferred_mouth_xywh), centroid_m, (None, size_m, 0.0))
+    if not faces_data:
+        draw.text((text_x, h // 2), "Обличчя не знайдено", font=font, fill=(0, 0, 255))
+    else:
+        face = faces_data[0]
 
-            eyes_for_face = []
-            
-            def classify_and_create_driver_part(part_data, original_frame, fastai_learner_instance):
-                if part_data:
-                    box_points = part_data[0]
-                    centroid = part_data[1]
+        text_y += line_height
+        draw.text((text_x, text_y), "Миттєвий стан:", font=font, fill=(200, 200, 200))
+        text_y += line_height
 
-                    x, y, w, h = cv2.boundingRect(box_points)
-                    
-                    x = max(0, x)
-                    y = max(0, y)
-                    w = min(w, original_frame.shape[1] - x)
-                    h = min(h, original_frame.shape[0] - y)
+        if face.eyes:
+            for eye in face.eyes:
+                eye_name = TRANSLATION_DICT.get(eye.id, "Око")
+                draw.text((text_x, text_y), f"- {eye_name}: {eye.label}", font=font, fill=(255, 255, 255))
+                text_y += line_height
+        else:
+            draw.text((text_x, text_y), "- Очі не знайдено", font=font, fill=(255, 165, 0))
+            text_y += line_height
 
-                    if w > 0 and h > 0:
-                        roi = original_frame[y:y+h, x:x+w]
-                        pred_label, _, _ = fastai_learner_instance.predict(roi)
-                        return box_points, centroid, str(pred_label)
-                return None, None, None
+        mouth_status = face.mouth.label if face.mouth else "Не визначено"
+        draw.text((text_x, text_y), f"- Рот: {mouth_status}", font=font, fill=(255, 255, 255))
 
-            left_eye_box_points, left_eye_centroid, left_eye_label = classify_and_create_driver_part(left_eye_final_data, frame, self.learn)
-            if left_eye_box_points is not None:
-                eyes_for_face.append(DriverEye(left_eye_box_points, left_eye_centroid, left_eye_label))
+        text_y += line_height * 1.5
+        draw.text((text_x, text_y), "Довгостроковий стан:", font=font, fill=(200, 200, 200))
+        text_y += line_height
 
-            right_eye_box_points, right_eye_centroid, right_eye_label = classify_and_create_driver_part(right_eye_final_data, frame, self.learn)
-            if right_eye_box_points is not None:
-                eyes_for_face.append(DriverEye(right_eye_box_points, right_eye_centroid, right_eye_label))
+        hist_status_text = TRANSLATION_DICT.get(face.historical_status, face.historical_status)
+        hist_status_color = (255, 0, 0) if face.historical_status == "PROLONGED_FATIGUE" else (0, 255, 0)
+        draw.text((text_x, text_y), hist_status_text, font=font, fill=hist_status_color)
 
-            face_box_points_final, face_centroid_final, face_label_fastai = classify_and_create_driver_part(face_final_data, frame, self.learn)
-            
-            if face_box_points_final is not None:
-                faces.append(DriverFace(face_box_points_final, face_centroid_final, face_label_fastai, eyes_for_face))
-
-        return faces
-
+    return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
 
 if __name__ == "__main__":
-    seg_model_instance = FaceSegmentationModel(
-        model_name="resnet34", 
-        weight_path="live_detection_with_image_segmentation\\weights\\resnet34.pt", 
-        input_size=(512, 512) 
+    try:
+        font_path = "C:/Windows/Fonts/arial.ttf"
+        main_font = ImageFont.truetype(font_path, 20)
+    except IOError:
+        print("Шрифт Arial не знайдено. Буде використано стандартний шрифт.")
+        main_font = ImageFont.load_default()
+
+    FPS = 24
+    HISTORY_SECONDS = 10
+    EYE_PLATEAU_SECONDS = 2.0  
+    YAWN_PLATEAU_SECONDS = 2.5 
+    FATIGUE_CONFIDENCE = 0.75
+
+    fatigue_analyzer = FatigueAnalyzer(
+        fps=FPS, 
+        history_seconds=HISTORY_SECONDS,
+        eye_plateau_sec=EYE_PLATEAU_SECONDS, 
+        yawn_plateau_sec=YAWN_PLATEAU_SECONDS,
+        fatigue_confidence=FATIGUE_CONFIDENCE
     )
 
+    seg_model_instance = FaceSegmentationModel(
+        model_name="resnet34",
+        weight_path="live_detection_with_image_segmentation\\weights\\resnet34.pt",
+        input_size=(512, 512)
+    )
+
+    
+
     cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Помилка: не вдалося відкрити вебкамеру.")
+        exit()
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    
-    dfps = DriverFatigueProcessingStream(segmentation_model=seg_model_instance).start()
 
+    dfps = DriverFatigueProcessingStream(
+        segmentation_model=seg_model_instance,
+        analyzer=fatigue_analyzer
+    ).start()
+
+    print("\nСистема запущена. Натисніть 'q' для виходу.")
+    
     while True:
         ret, frame = cap.read()
-
-        if not ret:
-            print("Помилка: Не вдалося отримати кадр")
+        if not ret: 
+            print("Не вдалося отримати кадр. Завершення роботи.")
             break
-
-        current_faces = dfps.update(frame.copy()) 
-
-        for face in current_faces:
-            cv2.polylines(frame, [face.box_points], True, (0, 255, 0), 2) 
-            cv2.putText(frame, face.label, (face.centroid[0], face.centroid[1] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
-            cv2.drawMarker(frame, face.centroid, (0, 0, 255), cv2.MARKER_CROSS, 10, 2)
-
-            for eye in face.eyes:
-                cv2.polylines(frame, [eye.box_points], True, (0, 255, 255), 2) 
-                cv2.putText(frame, eye.label, (eye.centroid[0], eye.centroid[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                cv2.drawMarker(frame, eye.centroid, (0, 0, 255), cv2.MARKER_CROSS, 10, 2)
         
-        cv2.imshow("Driver Monitoring System", frame)
+        frame = cv2.flip(frame, 1) 
 
-        if cv2.waitKey(30) & 0xFF == ord('q'):
-            print("Відеопотік зупинено користувачем.")
+        dfps.update(frame.copy())
+        current_faces = dfps.read()
+        
+        frame_mask = dfps.read_mask()
+        if (frame_mask is None):
+            cv2.imshow("Маска обличчя", frame)
+        else:
+            cv2.imshow("Маска обличчя", frame_mask)
+
+
+        display_frame = draw_info_panel(frame, current_faces, main_font)
+        cv2.imshow("Система моніторингу водія", display_frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     dfps.stop()
     cap.release()
     cv2.destroyAllWindows()
+    print("Роботу завершено.")
