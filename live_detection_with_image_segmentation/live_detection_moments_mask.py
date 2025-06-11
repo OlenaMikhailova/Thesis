@@ -8,8 +8,18 @@ import numpy as np
 import pathlib
 import torch
 from PIL import Image, ImageDraw, ImageFont
+import sys
+import os
 
-from inference import load_model, prepare_image
+current_dir = os.path.dirname(os.path.abspath(__file__))
+submodule_dir = os.path.join(current_dir, 'face_parsing')
+
+if submodule_dir not in sys.path:
+    sys.path.insert(0, submodule_dir)
+
+from face_parsing.inference import load_model, prepare_image 
+
+# from face_parsing.inference import load_model, prepare_image
 from mask_moments_utils import (
     calculate_centroids,
     find_part_rect,
