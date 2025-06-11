@@ -1,0 +1,3 @@
+[submodule "live_detection_with_image_segmentation/face_parsing"]
+	path = live_detection_with_image_segmentation/face_parsing
+	url = https://github.com/yakhyo/face-parsing.git
