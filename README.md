@@ -10,7 +10,6 @@
   - `live_detection/` – Простий прототип виявлення втоми.
   - `live_detection_with_image_segmentation/` – Покращений варіант з нейромережевою сегментацією.
 - `requirements.txt` – Список необхідних бібліотек.
-- `.gitmodules` – Конфігурація сабмодуля `face_parsing`.
 ###  Клонування репозиторію разом із сабмодулями
 ```bash
 git clone --recurse-submodules <АДРЕСА_РЕПОЗИТОРІЮ>
@@ -19,7 +18,7 @@ git clone --recurse-submodules <АДРЕСА_РЕПОЗИТОРІЮ>
 ```bash
 git submodule update --init --recursive
 ```
-###  Створення та активація віртуального середовища (опційно)
+###  Створення та активація віртуального середовища (необов'язково)
 ```bash
 python -m venv fatigue_detection_env
 source fatigue_detection_env/bin/activate   # Для Linux/Mac
@@ -57,7 +56,6 @@ python main.py --type simple
   - `live_detection/` – Simple prototype for detecting fatigue.
   - `live_detection_with_image_segmentation/` – Advanced prototype using semantic segmentation with helper scripts and notebooks.
 - `requirements.txt` – Required Python packages.
-- `.gitmodules` – Configuration for the face_parsing submodule.
 ### Clone the Repository with Submodules
 ```bash
 git clone --recurse-submodules <REPO_URL>
