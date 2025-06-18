@@ -74,7 +74,7 @@ fatigue_detection_env\Scripts\activate.bat  # Windows
 ```bash
 pip install -r requirements.txt
 ```
-### ⬇ Place the Model Weights
+###  Place the Model Weights
 - Face segmentation weights (`resnet34.pt`) ➜ `prototypes/live_detection_with_image_segmentation/weights/`
 - Classifier model (`yawn_eye_model.pkl`) ➜ `fatigue_model_training/`
 ###  Run the Application
